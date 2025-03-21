@@ -33,13 +33,16 @@ pub struct Output {
 
 impl Output {
     pub fn chaining_value(&self) -> [u32; 8] {
-        first_8_words(compress(
+        let cv = first_8_words(compress(
             &self.input_chaining_value,
             &self.block_words,
             self.counter,
             self.block_len,
             self.flags,
-        ))
+        ));
+        println!("Output chaining_value: input_cv={:?}, block_words={:?}, counter={}, block_len={}, flags={:b} => cv={:?}",
+            self.input_chaining_value, self.block_words, self.counter, self.block_len, self.flags, cv);
+        cv
     }
 
     pub fn root_output_bytes(&self, out_slice: &mut [u8]) {
@@ -67,6 +70,8 @@ pub fn parent_output(
     key_words: [u32; 8],
     flags: u32,
 ) -> Output {
+    println!("Creating parent node: left_cv={:?}, right_cv={:?}, key={:?}, flags={:b}",
+        left_child_cv, right_child_cv, key_words, flags);
     let mut block_words = [0; 16];
     block_words[..8].copy_from_slice(&left_child_cv);
     block_words[8..].copy_from_slice(&right_child_cv);
@@ -228,6 +233,8 @@ impl ChunkState {
     pub fn output(&self) -> Output {
         let mut block_words = [0; 16];
         words_from_little_endian_bytes(&self.block, &mut block_words);
+        println!("ChunkState output: cv={:?}, counter={}, block={:?}, block_len={}, blocks_compressed={}, flags={:b}",
+            self.chaining_value, self.chunk_counter, self.block, self.block_len, self.blocks_compressed, self.flags);
         let output = Output {
             input_chaining_value: self.chaining_value,
             block_words,
@@ -343,16 +350,21 @@ impl Blake3Hasher {
         // Starting with the Output from the current chunk, compute all the
         // parent chaining values along the right edge of the tree, until we
         // have the root Output.
+        println!("\nBLAKE3 Finalization:");
         let mut output = self.chunk_state.output();
+        println!("Initial chunk output cv: {:?}", output.chaining_value());
         let mut parent_nodes_remaining = self.cv_stack_len as usize;
         while parent_nodes_remaining > 0 {
             parent_nodes_remaining -= 1;
+            let stack_cv = self.cv_stack[parent_nodes_remaining];
+            println!("Combining with stack cv[{}]: {:?}", parent_nodes_remaining, stack_cv);
             output = parent_output(
                 self.cv_stack[parent_nodes_remaining],
                 output.chaining_value(),
                 self.key_words,
                 self.flags,
             );
+            println!("New output cv: {:?}", output.chaining_value());
         }
         output.root_output_bytes(out_slice);
     }
@@ -543,7 +555,7 @@ impl BinaryMerkleTree {
 
         (left_node_index, right_node_index)
     }
-} 
+}
 
 /// Process arbitrary input bytes into a vector of Output structs.
 /// This function:
@@ -582,4 +594,229 @@ pub fn process_input_to_chunks(input: &[u8]) -> Vec<Output> {
     }
     
     outputs
+}
+
+#[derive(Debug, Clone)]
+pub struct UnbalancedMerkleTree {
+    tree: Vec<Output>,
+    actual_leaves: usize,
+}
+
+impl UnbalancedMerkleTree {
+    pub fn new_from_leaves(leaves: Vec<Output>) -> Self {
+        let actual_leaves = leaves.len();
+        // Calculate the next power of two to allocate enough space
+        let number_of_leaves = leaves.len().next_power_of_two();
+        let mut tree = vec![Output {
+            input_chaining_value: IV,
+            block_words: [0; 16],
+            counter: 0,
+            block_len: 64,
+            flags: 0,
+        }; 2 * number_of_leaves];
+
+        // Create a new tree with the actual number of leaves
+        let mut binary_tree = UnbalancedMerkleTree { 
+            tree,
+            actual_leaves,
+        };
+        binary_tree.create_tree_from_leaves(leaves);
+        binary_tree
+    }
+
+    pub fn root(&self) -> Output {
+        let mut root = self.tree[1];
+        // Apply ROOT flag to the final root output
+        root.flags |= ROOT;
+        root
+    }
+
+    pub fn num_leaves(&self) -> usize {
+        self.actual_leaves
+    }
+
+    fn create_tree_from_leaves(&mut self, leaves: Vec<Output>) {
+        // Copy the actual leaves into the end of the tree
+        let leaf_start_index = self.tree.len() / 2;
+        for (i, leaf) in leaves.into_iter().enumerate() {
+            self.tree[leaf_start_index + i] = leaf;
+        }
+
+        // If there is only one leaf, the tree is simply that leaf
+        if self.actual_leaves == 1 {
+            self.tree[1] = self.tree[leaf_start_index];
+            return;
+        }
+
+        // Build ancestors level by level, from bottom to top
+        let mut current_level_start = leaf_start_index;
+        let mut nodes_at_current_level = self.actual_leaves;
+        
+        while current_level_start > 1 {
+            let parent_level_start = current_level_start / 2;
+            let nodes_in_parent_level = (nodes_at_current_level + 1) / 2;
+
+            for i in 0..nodes_in_parent_level {
+                let left_index = current_level_start + 2 * i;
+                let right_index = left_index + 1;
+                let parent_index = parent_level_start + i;
+
+                // For the last node in a level, if it doesn't have a right sibling,
+                // promote the left node directly to be the parent
+                if 2 * i + 1 >= nodes_at_current_level {
+                    self.tree[parent_index] = self.tree[left_index];
+                } else {
+                    // If we have both left and right children, create a parent node
+                    self.tree[parent_index] = parent_output(
+                        self.tree[left_index].chaining_value(),
+                        self.tree[right_index].chaining_value(),
+                        IV,
+                        0,
+                    );
+                }
+            }
+            current_level_start = parent_level_start;
+            nodes_at_current_level = nodes_in_parent_level;
+        }
+    }
+
+    pub fn insert_leaf(&mut self, leaf_index: usize, leaf_output: Output) {
+        println!("\nInserting leaf {} into unbalanced tree:", leaf_index);
+        println!("Leaf output cv: {:?}", leaf_output.chaining_value());
+        
+        if leaf_index >= self.actual_leaves {
+            // Extend the tree if inserting beyond current leaves
+            let new_actual_leaves = leaf_index + 1;
+            let new_size = new_actual_leaves.next_power_of_two() * 2;
+            println!("Resizing tree: actual_leaves {} -> {}, size {} -> {}", 
+                self.actual_leaves, new_actual_leaves, self.tree.len(), new_size);
+            if new_size > self.tree.len() {
+                self.tree.resize(new_size, self.tree[0]);
+            }
+            self.actual_leaves = new_actual_leaves;
+        }
+
+        let leaf_start = self.tree.len() / 2;
+        let real_leaf_index = leaf_index + leaf_start;
+        println!("Real leaf index: {} (leaf_start={})", real_leaf_index, leaf_start);
+        self.tree[real_leaf_index] = leaf_output;
+
+        let mut current_index = real_leaf_index;
+        while current_index > 1 {
+            let parent_index = current_index / 2;
+            let left_index = parent_index * 2;
+            let right_index = left_index + 1;
+
+            println!("\nProcessing node {}: parent={}, left={}, right={}", 
+                current_index, parent_index, left_index, right_index);
+
+            // Check if there is a valid right sibling
+            let right_leaf_index = right_index - leaf_start;
+            let has_right_sibling = right_leaf_index < self.actual_leaves;
+            println!("Right sibling check: right_leaf_index={}, has_right_sibling={}", 
+                right_leaf_index, has_right_sibling);
+
+            if has_right_sibling {
+                // Create a parent node combining both children
+                println!("Creating parent node with both children:");
+                println!("  Left  node cv: {:?}", self.tree[left_index].chaining_value());
+                println!("  Right node cv: {:?}", self.tree[right_index].chaining_value());
+                self.tree[parent_index] = parent_output(
+                    self.tree[left_index].chaining_value(),
+                    self.tree[right_index].chaining_value(),
+                    IV,
+                    0,
+                );
+                println!("  Parent node cv: {:?}", self.tree[parent_index].chaining_value());
+            } else {
+                // No right sibling, promote the left node directly
+                println!("No right sibling, promoting left node:");
+                println!("  Left node cv: {:?}", self.tree[left_index].chaining_value());
+                self.tree[parent_index] = self.tree[left_index];
+                println!("  Parent node cv: {:?}", self.tree[parent_index].chaining_value());
+            }
+            current_index = parent_index;
+        }
+        println!("Final root cv: {:?}", self.tree[1].chaining_value());
+    }
+
+    pub fn bulk_insert_leaves<I, J>(
+        &mut self,
+        leaf_indices_iter: I,
+        leaf_hashes_iter: J,
+    ) -> Option<()>
+    where
+        I: Iterator<Item = usize>,
+        J: Iterator<Item = Output>,
+    {
+        // Helper function to check if indices are sorted
+        fn is_sorted(indices: &[usize]) -> bool {
+            indices.windows(2).all(|w| w[0] < w[1])
+        }
+
+        // Collect indices and check if sorted
+        let leaf_indices: Vec<_> = leaf_indices_iter.collect();
+        if !is_sorted(&leaf_indices) {
+            return None;
+        }
+
+        // Find maximum leaf index and resize if needed
+        if let Some(&max_index) = leaf_indices.iter().max() {
+            if max_index >= self.actual_leaves {
+                let new_actual_leaves = max_index + 1;
+                let new_size = new_actual_leaves.next_power_of_two() * 2;
+                if new_size > self.tree.len() {
+                    self.tree.resize(new_size, self.tree[0]);
+                }
+                self.actual_leaves = new_actual_leaves;
+            }
+        }
+
+        // Insert all leaf nodes
+        let leaf_start = self.tree.len() / 2;
+        for (leaf_index, updated_leaf_hash) in leaf_indices.iter().zip(leaf_hashes_iter) {
+            self.tree[leaf_start + leaf_index] = updated_leaf_hash;
+        }
+
+        // Update ancestors using a queue to avoid duplicate updates
+        let mut update_queue = VecDeque::from(leaf_indices);
+        while let Some(leaf_index) = update_queue.pop_front() {
+            let current_index = leaf_start + leaf_index;
+            if current_index <= 1 {
+                break;
+            }
+
+            let parent_index = current_index / 2;
+            let left_index = parent_index * 2;
+            let right_index = left_index + 1;
+
+            // Skip if the next node is this node's sibling (they share a parent)
+            if let Some(&next_leaf_index) = update_queue.front() {
+                if leaf_start + next_leaf_index == right_index {
+                    update_queue.pop_front();
+                }
+            }
+
+            // Check if there is a valid right sibling
+            let right_leaf_index = right_index - leaf_start;
+            let has_right_sibling = right_leaf_index < self.actual_leaves;
+
+            if has_right_sibling {
+                // Create a parent node combining both children
+                self.tree[parent_index] = parent_output(
+                    self.tree[left_index].chaining_value(),
+                    self.tree[right_index].chaining_value(),
+                    IV,
+                    0,
+                );
+            } else {
+                // No right sibling, promote the left node directly
+                self.tree[parent_index] = self.tree[left_index];
+            }
+
+            update_queue.push_back(parent_index - leaf_start);
+        }
+
+        Some(())
+    }
 }
